@@ -1,10 +1,13 @@
 import io
 import json
 import logging
+import os.path
 import socket
 import struct
 import traceback
 import weakref
+from os.path import expanduser
+
 import paramiko
 import tornado.web
 
@@ -12,6 +15,8 @@ from concurrent.futures import ThreadPoolExecutor
 from tornado.ioloop import IOLoop
 from tornado.options import options
 from tornado.process import cpu_count
+
+from webssh.config_manager import ssh_hosts, ssh_configs
 from webssh.utils import (
     is_valid_ip_address, is_valid_port, is_valid_hostname, to_bytes, to_str,
     to_int, to_ip_address, UnicodeType, is_ip_hostname, is_same_primary_domain,
@@ -28,7 +33,6 @@ try:
     from urllib.parse import urlparse
 except ImportError:
     from urlparse import urlparse
-
 
 DEFAULT_PORT = 22
 
@@ -101,7 +105,6 @@ class SSHClient(paramiko.SSHClient):
 
 
 class PrivateKey(object):
-
     max_length = 16384  # rough number
 
     tag_to_name = {
@@ -143,7 +146,7 @@ class PrivateKey(object):
         logging.debug('Reset offset to {}.'.format(offset))
 
         logging.debug('Try parsing it as {} type key'.format(name))
-        pkeycls = getattr(paramiko, name+'Key')
+        pkeycls = getattr(paramiko, name + 'Key')
         pkey = None
 
         try:
@@ -179,12 +182,11 @@ class PrivateKey(object):
         msg = 'Invalid key'
         if self.password:
             msg += ' or wrong passphrase "{}" for decrypting it.'.format(
-                    self.password)
+                self.password)
         raise InvalidValueError(msg)
 
 
 class MixinHandler(object):
-
     custom_headers = {
         'Server': 'TornadoServer'
     }
@@ -313,8 +315,7 @@ class NotFoundHandler(MixinHandler, tornado.web.ErrorHandler):
 
 
 class IndexHandler(MixinHandler, tornado.web.RequestHandler):
-
-    executor = ThreadPoolExecutor(max_workers=cpu_count()*5)
+    executor = ThreadPoolExecutor(max_workers=cpu_count() * 5)
 
     def initialize(self, loop, policy, host_keys_settings):
         super(IndexHandler, self).initialize(loop)
@@ -383,9 +384,9 @@ class IndexHandler(MixinHandler, tornado.web.RequestHandler):
         if self.ssh_client._system_host_keys.lookup(key) is None:
             if self.ssh_client._host_keys.lookup(key) is None:
                 raise tornado.web.HTTPError(
-                        403, 'Connection to {}:{} is not allowed.'.format(
-                            hostname, port)
-                    )
+                    403, 'Connection to {}:{} is not allowed.'.format(
+                        hostname, port)
+                )
 
     def get_args(self):
         hostname = self.get_hostname()
@@ -446,13 +447,33 @@ class IndexHandler(MixinHandler, tornado.web.RequestHandler):
         logging.warning('Could not detect the default encoding.')
         return 'utf-8'
 
-    def ssh_connect(self, args):
+    def ssh_connect(self, args, ssh_host=None):
         ssh = self.ssh_client
-        dst_addr = args[:2]
+        if ssh_host is None:
+            dst_addr = args[:2]
+        else:
+            config = ssh_configs.host(ssh_host)
+            dst_addr = [config['hostname'], config['port']]
         logging.info('Connecting to {}:{}'.format(*dst_addr))
 
         try:
-            ssh.connect(*args, timeout=options.timeout)
+            if ssh_host is None:
+                ssh.connect(*args, timeout=options.timeout)
+            else:
+                ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                args = {i: config[i] for i in ['hostname', 'port', 'user']}
+                pkey = None
+                if config.get('identityfile', None) is not None:
+                    pkey_path = expanduser(config['identityfile'])
+                    filename = os.path.split(pkey_path)[-1]
+                    with open(pkey_path) as f:
+                        if 'rsa' in filename:
+                            pkey = paramiko.RSAKey.from_private_key(f)
+                        elif 'ecdsa' in filename:
+                            pkey = paramiko.ECDSAKey.from_private_key(f)
+                        else:
+                            pkey = paramiko.Ed25519Key.from_private_key(f)
+                ssh.connect(*args.values(), passphrase=ssh_host, pkey=pkey, timeout=options.timeout)
         except socket.error:
             raise ValueError('Unable to connect to {}:{}'.format(*dst_addr))
         except paramiko.BadAuthenticationType:
@@ -488,7 +509,13 @@ class IndexHandler(MixinHandler, tornado.web.RequestHandler):
         pass
 
     def get(self):
-        self.render('index.html', debug=self.debug, font=self.font)
+        ssh_host = self.get_argument('ssh_host', None)
+        kwargs = {}
+        if ssh_host is not None:
+            config = ssh_configs.host(ssh_host)
+            kwargs = {'username': config['user'], 'hostname': 'hostname'}
+        self.render('index.html', debug=self.debug, font=self.font, ssh_hosts=ssh_hosts,
+                    selected=ssh_host is not None, **kwargs)
 
     @tornado.gen.coroutine
     def post(self):
@@ -503,12 +530,16 @@ class IndexHandler(MixinHandler, tornado.web.RequestHandler):
 
         self.check_origin()
 
-        try:
-            args = self.get_args()
-        except InvalidValueError as exc:
-            raise tornado.web.HTTPError(400, str(exc))
+        ssh_host = self.get_argument('ssh_host', None)
+        if ssh_host is None:
+            try:
+                args = self.get_args()
+            except InvalidValueError as exc:
+                raise tornado.web.HTTPError(400, str(exc))
+        else:
+            args = []
 
-        future = self.executor.submit(self.ssh_connect, args)
+        future = self.executor.submit(self.ssh_connect, args, ssh_host)
 
         try:
             worker = yield future
