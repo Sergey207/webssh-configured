@@ -6,16 +6,18 @@ import socket
 import struct
 import traceback
 import weakref
+from concurrent.futures import ThreadPoolExecutor
 from os.path import expanduser
+from typing import Any
 
 import paramiko
 import tornado.web
-
-from concurrent.futures import ThreadPoolExecutor
 from tornado.ioloop import IOLoop
 from tornado.options import options
 from tornado.process import cpu_count
+from tornado.web import RequestHandler
 
+from webssh.auth import PASSWORDS
 from webssh.config_manager import ssh_hosts, ssh_configs
 from webssh.utils import (
     is_valid_ip_address, is_valid_port, is_valid_hostname, to_bytes, to_str,
@@ -339,6 +341,9 @@ class IndexHandler(MixinHandler, tornado.web.RequestHandler):
         else:
             super(IndexHandler, self).write_error(status_code, **kwargs)
 
+    def get_current_user(self) -> Any:
+        return self.get_secure_cookie('user')
+
     def get_ssh_client(self):
         ssh = SSHClient()
         ssh._system_host_keys = self.host_keys_settings['system_host_keys']
@@ -508,7 +513,9 @@ class IndexHandler(MixinHandler, tornado.web.RequestHandler):
     def head(self):
         pass
 
+    @tornado.web.authenticated
     def get(self):
+        # self.set_secure_cookie('user', '')
         ssh_host = self.get_argument('ssh_host', None)
         kwargs = {}
         if ssh_host is not None:
@@ -632,3 +639,25 @@ class WsockHandler(MixinHandler, tornado.websocket.WebSocketHandler):
         worker = self.worker_ref() if self.worker_ref else None
         if worker:
             worker.close(reason=self.close_reason)
+
+
+class LoginHandler(RequestHandler):
+    def get(self):
+        error = self.get_argument('error', u'')
+        if error == 'login':
+            message = "Login wasn't found in passwords.json!"
+        elif error == 'password':
+            message = "Invalid password!"
+        else:
+            message = ""
+        self.render('login.html', message=message)
+
+    def post(self):
+        if self.get_argument('login') in PASSWORDS.keys():
+            if PASSWORDS[self.get_argument('login')] == self.get_argument('password'):
+                self.set_secure_cookie('user', self.get_argument('login'))
+                self.redirect('/')
+            else:
+                self.redirect('/login?error=password')
+        else:
+            self.redirect('/login?error=login')

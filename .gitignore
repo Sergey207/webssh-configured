@@ -64,5 +64,8 @@ target/
 # known_hosts file
 known_hosts
 
-#idea files
+# idea files
 .idea
+
+# passwords file
+passwords.json

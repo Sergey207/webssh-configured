@@ -5,4 +5,4 @@ services:
     ports:
     - "8888:8888"
     volumes:
-      - /home/sergey/.ssh:/home/webssh/.ssh
+      - ~/.ssh:/home/webssh/.ssh
